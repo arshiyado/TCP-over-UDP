@@ -6,37 +6,44 @@ import threading
 from packet import Packet
 
 class TCPConnection:
+    
     def __init__(self, udp_socket, peer_address, buffer_size=4096):
-        self.socket = udp_socket
-        self.peer = peer_address
-        self.send_base = random.randint(0, 10000)
-        self.next_seq_num = self.send_base
-        self.ack_num = 0
+            self.socket = udp_socket
+            self.peer = peer_address  # Tuple: (IP, port)
 
-        self.send_buffer = {}
-        self.receive_buffer = {}
-        self.expected_seq_num = 0
+            # Extract ports
+            self.local_port = self.socket.getsockname()[1]
+            self.remote_port = self.peer[1]
 
-        self.receiver_window = buffer_size
-        self.sender_window = buffer_size
+            self.send_base = random.randint(0, 10000)
+            self.next_seq_num = self.send_base
+            self.ack_num = 0
 
-        self.timeout = 1.0
-        self.max_segment_size = 1000
+            self.send_buffer = {}
+            self.receive_buffer = {}
+            self.expected_seq_num = 0
 
-        self.closed = False
-        self.fin_received = False
+            self.receiver_window = buffer_size
+            self.sender_window = buffer_size
 
-        # Congestion control parameters
-        self.cwnd = 1
-        self.ssthresh = 16
-        self.dup_ack_count = 0
-        self.last_ack = None
-        self.accept_queue = queue.Queue()
-        self.accept_lock = threading.Lock()
+            self.timeout = 1.0
+            self.max_segment_size = 1000
+
+            self.closed = False
+            self.fin_received = False
+
+            # Congestion control parameters
+            self.cwnd = 1
+            self.ssthresh = 16
+            self.dup_ack_count = 0
+            self.last_ack = None
+
+            self.accept_queue = queue.Queue()
+            self.accept_lock = threading.Lock()
 
     
     def handle_handshake_client(self):
-        syn_packet = Packet(seq_num=self.send_base, syn=True, window_size=self.sender_window)
+        syn_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base, syn=True, window_size=self.sender_window)
         self.socket.sendto(syn_packet.to_bytes(), self.peer)
         print(f"[CLIENT] Sent SYN {syn_packet}")
 
@@ -57,7 +64,7 @@ class TCPConnection:
                 self.socket.sendto(syn_packet.to_bytes(), self.peer)
 
         # ✅ Final ACK with ACK flag set to True
-        ack_packet = Packet(seq_num=self.send_base + 1, ack_num=self.ack_num, ack=True,
+        ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base + 1, ack_num=self.ack_num, ack=True,
                             window_size=self.sender_window)
         self.socket.sendto(ack_packet.to_bytes(), self.peer)
         print(f"[CLIENT] Sent final ACK {ack_packet}")
@@ -83,7 +90,7 @@ class TCPConnection:
         self.receiver_window = packet.window_size
         self.expected_seq_num = packet.seq_num + 1
 
-        syn_ack_packet = Packet(seq_num=self.send_base, ack_num=self.ack_num,
+        syn_ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base, ack_num=self.ack_num,
                                 syn=True, ack=True, window_size=self.sender_window)
         self.socket.sendto(syn_ack_packet.to_bytes(), self.peer)
         print(f"[SERVER] Sent SYN-ACK {syn_ack_packet}")
@@ -109,7 +116,7 @@ class TCPConnection:
         while index < len(data) or self.send_buffer:
             while index < len(data) and (self.next_seq_num - self.send_base) < min(self.receiver_window, self.cwnd * self.max_segment_size):
                 segment = data[index: index + self.max_segment_size]
-                packet = Packet(seq_num=self.next_seq_num, ack_num=self.ack_num,
+                packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num, ack_num=self.ack_num,
                                 payload=segment, window_size=self.sender_window)
                 self.socket.sendto(packet.to_bytes(), self.peer)
                 self.send_buffer[self.next_seq_num] = (packet, time.time())
@@ -197,7 +204,7 @@ class TCPConnection:
                     elif seq > self.expected_seq_num:
                         self.receive_buffer[seq] = packet.payload
 
-                    ack_packet = Packet(seq_num=self.next_seq_num,
+                    ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
                                         ack_num=self.expected_seq_num,
                                         ack=True,
                                         window_size=self.sender_window)
@@ -209,7 +216,7 @@ class TCPConnection:
                 continue
 
     def close(self):
-        fin_packet = Packet(seq_num=self.next_seq_num, ack_num=self.ack_num, fin=True,
+        fin_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num, ack_num=self.ack_num, fin=True,
                             window_size=self.sender_window)
         self.socket.sendto(fin_packet.to_bytes(), self.peer)
         print(f"[CLOSE] Sent FIN")
@@ -256,14 +263,14 @@ class TCPConnection:
     def _handle_fin(self, packet):
         self.fin_received = True
 
-        ack_packet = Packet(seq_num=self.next_seq_num,
+        ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
                             ack_num=packet.seq_num + 1,
                             ack=True, window_size=self.sender_window)
         self.socket.sendto(ack_packet.to_bytes(), self.peer)
         print(f"[FIN] Received FIN. Sent ACK")
 
         time.sleep(0.1)
-        fin_packet = Packet(seq_num=self.next_seq_num,
+        fin_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
                             ack_num=packet.seq_num + 1,
                             fin=True, window_size=self.sender_window)
         self.socket.sendto(fin_packet.to_bytes(), self.peer)

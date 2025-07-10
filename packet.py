@@ -1,11 +1,13 @@
 import struct
 
 class Packet:
-    HEADER_FORMAT = '!II B H H'
+    HEADER_FORMAT = '!HHII B H H'
     HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-    def __init__(self, seq_num=0, ack_num=0, syn=False, ack=False, fin=False,
+    def __init__(self, src_port=0, dest_port=0, seq_num=0, ack_num=0, syn=False, ack=False, fin=False,
                  payload=b'', window_size=4096):
+        self.src_port = src_port
+        self.dest_port = dest_port
         self.seq_num = seq_num
         self.ack_num = ack_num
         self.syn = syn
@@ -18,6 +20,8 @@ class Packet:
         flags = (self.syn << 2) | (self.ack << 1) | self.fin
         header = struct.pack(
             self.HEADER_FORMAT,
+            self.src_port,
+            self.dest_port,
             self.seq_num,
             self.ack_num,
             flags,
@@ -31,15 +35,22 @@ class Packet:
         header = data[:cls.HEADER_SIZE]
         payload = data[cls.HEADER_SIZE:]
 
-        seq_num, ack_num, flags, payload_len, window_size = struct.unpack(
-            cls.HEADER_FORMAT, header)
-        syn = bool((flags >> 2) & 1)
-        ack = bool((flags >> 1) & 1)
-        fin = bool(flags & 1)
-        payload = payload[:payload_len]
+        src_port, dest_port, seq_num, ack_num, flags, payload_len, window_size = struct.unpack(
+            cls.HEADER_FORMAT, header
+        )
 
-        return cls(seq_num, ack_num, syn, ack, fin, payload, window_size)
+        syn = bool(flags & 0b100)
+        ack = bool(flags & 0b010)
+        fin = bool(flags & 0b001)
 
-    def __str__(self):
-        return (f"Packet(seq={self.seq_num}, ack={self.ack_num}, SYN={self.syn}, "
-                f"ACK={self.ack}, FIN={self.fin}, win={self.window_size}, payload={self.payload})")
+        return cls(
+            src_port=src_port,
+            dest_port=dest_port,
+            seq_num=seq_num,
+            ack_num=ack_num,
+            syn=syn,
+            ack=ack,
+            fin=fin,
+            payload=payload[:payload_len],
+            window_size=window_size
+        )
