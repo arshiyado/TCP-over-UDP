@@ -1,56 +1,87 @@
+"""
+Common protocol definitions and Packet class for pseudo-TCP over UDP.
+"""
+
 import struct
 
+# === Constants ===
+MSS = 536  # bytes
+DEFAULT_RTO = 0.5  # seconds
+MAX_WINDOW = 65535  # uint16
+
+FLAG_SYN = 0x01
+FLAG_ACK = 0x02
+FLAG_FIN = 0x04
+FLAG_RST = 0x08
+
+_HDR_FMT = "!HHIIBHH"  # src port, dst port, seq, ack, flags, window, length
+_HDR_LEN = struct.calcsize(_HDR_FMT)
+
+
+def _mod32_lt(a: int, b: int) -> bool:
+    """Return True if sequence number *a* precedes *b* in modulo-2^32 space."""
+    return ((a - b) & 0xFFFFFFFF) > 0x80000000
+
+
 class Packet:
-    HEADER_FORMAT = '!HHII B H H'
-    HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
+    """Lightweight transport segment used by our UDP-based TCP re-implementation."""
 
-    def __init__(self, src_port=0, dest_port=0, seq_num=0, ack_num=0, syn=False, ack=False, fin=False,
-                 payload=b'', window_size=4096):
-        self.src_port = src_port
-        self.dest_port = dest_port
-        self.seq_num = seq_num
-        self.ack_num = ack_num
-        self.syn = syn
-        self.ack = ack
-        self.fin = fin
-        self.payload = payload
-        self.window_size = window_size
+    __slots__ = (
+        "src_port",
+        "dst_port",
+        "seq",
+        "ack",
+        "flags",
+        "window",
+        "payload",
+    )
 
-    def to_bytes(self):
-        flags = (self.syn << 2) | (self.ack << 1) | self.fin
+    def __init__(self, src_port: int, dst_port: int, seq: int = 0, ack: int = 0,
+                 flags: int = 0, window: int = MAX_WINDOW, payload: bytes | bytearray = b""):
+        self.src_port = src_port & 0xFFFF
+        self.dst_port = dst_port & 0xFFFF
+        self.seq = seq & 0xFFFFFFFF
+        self.ack = ack & 0xFFFFFFFF
+        self.flags = flags & 0xFF
+        self.window = window & 0xFFFF
+        self.payload = bytes(payload)
+
+    # ------------------------------------------------------------------
+    # (De)serialisation helpers
+    # ------------------------------------------------------------------
+
+    def to_bytes(self) -> bytes:
+        length = len(self.payload)
         header = struct.pack(
-            self.HEADER_FORMAT,
+            _HDR_FMT,
             self.src_port,
-            self.dest_port,
-            self.seq_num,
-            self.ack_num,
-            flags,
-            len(self.payload),
-            self.window_size
+            self.dst_port,
+            self.seq,
+            self.ack,
+            self.flags,
+            self.window,
+            length,
         )
         return header + self.payload
 
     @classmethod
-    def from_bytes(cls, data):
-        header = data[:cls.HEADER_SIZE]
-        payload = data[cls.HEADER_SIZE:]
+    def from_bytes(cls, data: bytes) -> "Packet":
+        if len(data) < _HDR_LEN:
+            raise ValueError("Packet too short")
+        src, dst, seq, ack, flags, window, length = struct.unpack(_HDR_FMT, data[:_HDR_LEN])
+        payload = data[_HDR_LEN:_HDR_LEN + length]
+        return cls(src, dst, seq, ack, flags, window, payload)
 
-        src_port, dest_port, seq_num, ack_num, flags, payload_len, window_size = struct.unpack(
-            cls.HEADER_FORMAT, header
-        )
+    # ------------------------------------------------------------------
+    # Convenience
+    # ------------------------------------------------------------------
 
-        syn = bool(flags & 0b100)
-        ack = bool(flags & 0b010)
-        fin = bool(flags & 0b001)
+    def flag_set(self, f: int) -> bool:
+        return bool(self.flags & f)
 
-        return cls(
-            src_port=src_port,
-            dest_port=dest_port,
-            seq_num=seq_num,
-            ack_num=ack_num,
-            syn=syn,
-            ack=ack,
-            fin=fin,
-            payload=payload[:payload_len],
-            window_size=window_size
-        )
+    def __repr__(self) -> str:  # pragma: no cover
+        names = []
+        for bit, name in ((FLAG_SYN, "SYN"), (FLAG_ACK, "ACK"), (FLAG_FIN, "FIN"), (FLAG_RST, "RST")):
+            if self.flags & bit:
+                names.append(name)
+        return f"<Packet {','.join(names) or 'DATA'} seq={self.seq} ack={self.ack} len={len(self.payload)}>"

@@ -1,287 +1,259 @@
-import random
-import socket
-import time
-import queue
+"""
+Reliable byte‑stream Connection built on Packet and UDP socket.
+Implements 3‑way handshake, data transfer with ACKs, 4‑way close, **retransmission**,
+**basic TCP‑like congestion control (Tahoe/Reno)**.
+"""
+
+from __future__ import annotations
+
+import logging
 import threading
-from packet import Packet
+import time
+from collections import deque
+from typing import Tuple
 
-class TCPConnection:
-    
-    def __init__(self, udp_socket, peer_address, buffer_size=4096):
-            self.socket = udp_socket
-            self.peer = peer_address  # Tuple: (IP, port)
+from packet import Packet, _mod32_lt, MSS, MAX_WINDOW, DEFAULT_RTO, FLAG_ACK, FLAG_FIN
 
-            # Extract ports
-            self.local_port = self.socket.getsockname()[1]
-            self.remote_port = self.peer[1]
-
-            self.send_base = random.randint(0, 10000)
-            self.next_seq_num = self.send_base
-            self.ack_num = 0
-
-            self.send_buffer = {}
-            self.receive_buffer = {}
-            self.expected_seq_num = 0
-
-            self.receiver_window = buffer_size
-            self.sender_window = buffer_size
-
-            self.timeout = 1.0
-            self.max_segment_size = 1000
-
-            self.closed = False
-            self.fin_received = False
-
-            # Congestion control parameters
-            self.cwnd = 1
-            self.ssthresh = 16
-            self.dup_ack_count = 0
-            self.last_ack = None
-
-            self.accept_queue = queue.Queue()
-            self.accept_lock = threading.Lock()
-
-    
-    def handle_handshake_client(self):
-        syn_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base, syn=True, window_size=self.sender_window)
-        self.socket.sendto(syn_packet.to_bytes(), self.peer)
-        print(f"[CLIENT] Sent SYN {syn_packet}")
-
-        while True:
-            try:
-                data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                packet = Packet.from_bytes(data)
-                print(f"[CLIENT] Received {packet}")
-                if packet.syn and packet.ack:
-                    self.ack_num = packet.seq_num + 1
-                    self.receiver_window = packet.window_size
-                    self.expected_seq_num = packet.seq_num + 1
-                    break
-            except socket.timeout:
-                print("[CLIENT] SYN-ACK timeout. Retrying...")
-                self.socket.sendto(syn_packet.to_bytes(), self.peer)
-
-        # ✅ Final ACK with ACK flag set to True
-        ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base + 1, ack_num=self.ack_num, ack=True,
-                            window_size=self.sender_window)
-        self.socket.sendto(ack_packet.to_bytes(), self.peer)
-        print(f"[CLIENT] Sent final ACK {ack_packet}")
-
-        self.next_seq_num = self.send_base + 1
-
-        # ⚠️ Brief delay to ensure ACK arrives before data starts
-        time.sleep(0.1)
-
-        print("[CLIENT] Handshake complete.")
+log = logging.getLogger(__name__)
 
 
-    def handle_handshake_server(self, data):
-        packet = Packet.from_bytes(data)
-        print(f"[SERVER] Received {packet}")
+class Connection:
+    """Represents one established pseudo‑TCP connection (duplex)."""
 
-        if not packet.syn:
-            raise Exception("Handshake error: Expected SYN")
+    # ------------------------------------------------------------------
+    # Construction / state
+    # ------------------------------------------------------------------
 
-        self.ack_num = packet.seq_num + 1
-        self.send_base = random.randint(0, 10000)
-        self.next_seq_num = self.send_base
-        self.receiver_window = packet.window_size
-        self.expected_seq_num = packet.seq_num + 1
+    def __init__(self, sock, local_addr: Tuple[str, int], remote_addr: Tuple[str, int],
+                 snd_initial: int, rcv_initial: int, is_active: bool):
+        self._sock = sock
+        self._sock_lock = threading.Lock()
 
-        syn_ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.send_base, ack_num=self.ack_num,
-                                syn=True, ack=True, window_size=self.sender_window)
-        self.socket.sendto(syn_ack_packet.to_bytes(), self.peer)
-        print(f"[SERVER] Sent SYN-ACK {syn_ack_packet}")
+        self.local_addr = local_addr
+        self.remote_addr = remote_addr
 
-        while True:
-            try:
-                data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                packet = Packet.from_bytes(data)
-                print(f"[SERVER] Received {packet}")
-                if packet.ack and packet.ack_num == self.send_base + 1:
-                    self.next_seq_num = self.send_base + 1
-                    print("[SERVER] Handshake complete.")
-                    break
-            except socket.timeout:
-                print("[SERVER] ACK timeout. Resending SYN-ACK...")
-                self.socket.sendto(syn_ack_packet.to_bytes(), self.peer)
+        # --- Sender sequence numbers ---
+        self._snd_una = snd_initial  # oldest unacknowledged
+        self._snd_nxt = snd_initial  # next sequence number
+        self._snd_wnd = MAX_WINDOW   # receiver‑advertised window
 
-    def send(self, data):
-        index = 0
+        # --- Receiver state ---
+        self._rcv_nxt = (rcv_initial + 1) & 0xFFFFFFFF
+        self._rcv_wnd = MAX_WINDOW
 
-        while index < len(data) or self.send_buffer:
-            while index < len(data) and (self.next_seq_num - self.send_base) < min(self.receiver_window, self.cwnd * self.max_segment_size):
-                segment = data[index: index + self.max_segment_size]
-                packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num, ack_num=self.ack_num,
-                                payload=segment, window_size=self.sender_window)
-                self.socket.sendto(packet.to_bytes(), self.peer)
-                self.send_buffer[self.next_seq_num] = (packet, time.time())
+        # --- Congestion‑control state ---
+        self._cwnd = MSS            # congestion window (bytes)
+        self._ssthresh = 65535      # initial slow‑start threshold
+        self._dup_ack_cnt = 0
+        self._last_ack = snd_initial
 
-                print(f"[SEND] Message: {segment}")
-                print(f"       SEQ={packet.seq_num}, ACK={packet.ack_num}, win={packet.window_size}, "
-                      f"SYN={packet.syn}, ACK_FLAG={packet.ack}, FIN={packet.fin}")
+        # --- Buffers ---
+        self._send_buf: deque[tuple[int, bytes]] = deque()
+        self._recv_buf = bytearray()
+        self._recv_cv = threading.Condition()
 
-                self.next_seq_num += len(segment)
-                index += len(segment)
+        # --- Timers & flags ---
+        self._rto = DEFAULT_RTO
+        self._timer: threading.Timer | None = None
+        self._closing = False
+        self._closed = threading.Event()
 
-            try:
-                self.socket.settimeout(0.5)
-                recv_data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                ack_packet = Packet.from_bytes(recv_data)
+        # Launch RX handler thread
+        threading.Thread(target=self._rx_loop, daemon=True).start()
 
-                if ack_packet.ack:
-                    ack_num = ack_packet.ack_num
-                    keys_to_remove = [seq for seq in self.send_buffer if seq < ack_num]
-                    for seq in keys_to_remove:
-                        del self.send_buffer[seq]
+        if is_active:
+            self._start_timer()
 
-                    if ack_num == self.last_ack:
-                        self.dup_ack_count += 1
-                    else:
-                        self.dup_ack_count = 1
-                        self.last_ack = ack_num
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-                    if self.dup_ack_count == 3:
-                        if ack_num in self.send_buffer:
-                            self.socket.sendto(self.send_buffer[ack_num][0].to_bytes(), self.peer)
-                        self.ssthresh = max(self.cwnd // 2, 1)
-                        self.cwnd = 1
+    def send(self, data: bytes):
+        if self._closing:
+            raise RuntimeError("Connection closing")
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset: offset + MSS]
+            offset += len(chunk)
+            with self._sock_lock:
+                seq = self._snd_nxt
+                self._snd_nxt = (self._snd_nxt + len(chunk)) & 0xFFFFFFFF
+                self._send_buf.append((seq, chunk))
+            self._pump_send()
+        while self._send_buf:
+            time.sleep(0.01)
 
-                    if ack_num > self.send_base:
-                        if self.cwnd < self.ssthresh:
-                            self.cwnd += 1  # slow start
-                        else:
-                            self.cwnd += 1 / self.cwnd  # congestion avoidance
-
-                    self.send_base = ack_num
-                    self.receiver_window = ack_packet.window_size
-            except socket.timeout:
-                pass
-
-            current_time = time.time()
-            for seq, (packet, timestamp) in list(self.send_buffer.items()):
-                if current_time - timestamp > self.timeout:
-                    self.socket.sendto(packet.to_bytes(), self.peer)
-                    self.send_buffer[seq] = (packet, current_time)
-                    print(f"[RETRANSMIT] Retransmitting packet starting at seq {seq}")
-                    print(f"              SEQ={packet.seq_num}, ACK={packet.ack_num}, win={packet.window_size}, "
-                          f"SYN={packet.syn}, ACK_FLAG={packet.ack}, FIN={packet.fin}")
-
-    def recv(self):
-        data_collected = b''
-
-        while not self.closed:
-            try:
-                self.socket.settimeout(0.5)
-                recv_data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                packet = Packet.from_bytes(recv_data)
-
-                if packet.fin:
-                    self._handle_fin(packet)
-                    return b''
-
-                if packet.payload:
-                    seq = packet.seq_num
-
-                    if seq == self.expected_seq_num:
-                        data_collected += packet.payload
-                        self.expected_seq_num += len(packet.payload)
-                        self.ack_num = self.expected_seq_num
-
-                        while self.expected_seq_num in self.receive_buffer:
-                            data_collected += self.receive_buffer.pop(self.expected_seq_num)
-                            self.expected_seq_num += len(packet.payload)
-                            self.ack_num = self.expected_seq_num
-
-                    elif seq > self.expected_seq_num:
-                        self.receive_buffer[seq] = packet.payload
-
-                    ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
-                                        ack_num=self.expected_seq_num,
-                                        ack=True,
-                                        window_size=self.sender_window)
-                    self.socket.sendto(ack_packet.to_bytes(), self.peer)
-
-                    if data_collected:
-                        return data_collected
-            except socket.timeout:
-                continue
+    def receive(self, nbytes: int) -> bytes:
+        output = bytearray()
+        with self._recv_cv:
+            while len(output) < nbytes:
+                if self._recv_buf:
+                    take = min(nbytes - len(output), len(self._recv_buf))
+                    output += self._recv_buf[:take]
+                    del self._recv_buf[:take]
+                else:
+                    self._recv_cv.wait()
+        
+        # --- Flow‑control: window update after application consumed data ---
+        old_wnd = self._rcv_wnd
+        self._rcv_wnd = max(0, MAX_WINDOW - len(self._recv_buf))
+        if self._rcv_wnd > old_wnd and (self._rcv_wnd - old_wnd) >= MSS:
+            # Notify peer about newly available window
+            update = Packet(self.local_addr[1], self.remote_addr[1], self._snd_nxt, self._rcv_nxt,
+                            FLAG_ACK, self._rcv_wnd)
+            with self._sock_lock:
+                self._send_raw(update)
+        return bytes(output)
 
     def close(self):
-        fin_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num, ack_num=self.ack_num, fin=True,
-                            window_size=self.sender_window)
-        self.socket.sendto(fin_packet.to_bytes(), self.peer)
-        print(f"[CLOSE] Sent FIN")
+        if self._closing:
+            return
+        self._closing = True
+        with self._sock_lock:
+            fin = Packet(self.local_addr[1], self.remote_addr[1], self._snd_nxt, self._rcv_nxt,
+                          FLAG_FIN | FLAG_ACK, self._rcv_wnd)
+            self._send_raw(fin)
+            self._snd_nxt = (self._snd_nxt + 1) & 0xFFFFFFFF
+        self._closed.wait()
 
-        start = time.time()
-        while time.time() - start < 5:
-            try:
-                self.socket.settimeout(1.0)
-                data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                packet = Packet.from_bytes(data)
-                if packet.ack and packet.ack_num == self.next_seq_num + 1:
-                    print(f"[CLOSE] Received ACK for our FIN")
+    # ------------------------------------------------------------------
+    # Congestion‑control helpers
+    # ------------------------------------------------------------------
+
+    def _in_slow_start(self) -> bool:
+        return self._cwnd < self._ssthresh
+
+    def _on_new_ack(self, acked_bytes: int):
+        if self._in_slow_start():
+            # Exponential growth
+            self._cwnd += MSS
+        else:
+            # Congestion avoidance (linear)
+            self._cwnd += MSS * MSS // self._cwnd
+        self._dup_ack_cnt = 0
+        log.debug("ACK advance → cwnd=%d ssthresh=%d", self._cwnd, self._ssthresh)
+
+    def _on_dup_ack(self):
+        self._dup_ack_cnt += 1
+        if self._dup_ack_cnt == 3:
+            # Fast retransmit / fast recovery (Tahoe/Reno mix)
+            self._ssthresh = max(self._cwnd // 2, MSS)
+            self._cwnd = self._ssthresh + 3 * MSS
+            log.debug("Fast retransmit triggered, cwnd=%d ssthresh=%d", self._cwnd, self._ssthresh)
+            # retransmit first unacked segment immediately
+            if self._send_buf:
+                seq, payload = self._send_buf[0]
+                pkt = Packet(self.local_addr[1], self.remote_addr[1], seq, self._rcv_nxt,
+                              FLAG_ACK, self._rcv_wnd, payload)
+                self._send_raw(pkt)
+
+    def _on_timeout_cc(self):
+        self._ssthresh = max(self._cwnd // 2, MSS)
+        self._cwnd = MSS
+        self._dup_ack_cnt = 0
+        log.debug("Timeout → cwnd=%d ssthresh=%d", self._cwnd, self._ssthresh)
+
+    # ------------------------------------------------------------------
+    # Internal timers
+    # ------------------------------------------------------------------
+
+    def _start_timer(self):
+        if self._timer:
+            self._timer.cancel()
+        self._timer = threading.Timer(self._rto, self._on_timeout)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _on_timeout(self):
+        with self._sock_lock:
+            self._on_timeout_cc()
+            if self._send_buf:
+                seq, payload = self._send_buf[0]
+                pkt = Packet(self.local_addr[1], self.remote_addr[1], seq, self._rcv_nxt,
+                              FLAG_ACK, self._rcv_wnd, payload)
+                self._send_raw(pkt)
+                self._start_timer()
+
+    # ------------------------------------------------------------------
+    # Sending logic
+    # ------------------------------------------------------------------
+
+    def _pump_send(self):
+        with self._sock_lock:
+            while self._send_buf:
+                outstanding = (self._snd_nxt - self._snd_una) & 0xFFFFFFFF
+                wnd = min(self._cwnd, self._snd_wnd)
+                if outstanding >= wnd:
                     break
-            except socket.timeout:
-                print("[CLOSE] Timeout. Resending FIN...")
-                self.socket.sendto(fin_packet.to_bytes(), self.peer)
+                seq, payload = self._send_buf[0]
+                pkt = Packet(self.local_addr[1], self.remote_addr[1], seq, self._rcv_nxt,
+                              FLAG_ACK if payload else 0, self._rcv_wnd, payload)
+                self._send_raw(pkt)
+                if seq == self._snd_una:
+                    self._start_timer()
+                self._send_buf.popleft()
 
-        self.next_seq_num += 1
+    def _send_raw(self, pkt: Packet):
+        self._sock.sendto(pkt.to_bytes(), self.remote_addr)
 
-        print("[CLOSE] Waiting for FIN from peer...")
-        start = time.time()
-        while time.time() - start < 5:
-            if self.fin_received:
-                print("[CLOSE] FIN already received in another thread.")
-                break
+    # ------------------------------------------------------------------
+    # RX path
+    # ------------------------------------------------------------------
+
+    def _handle(self, pkt: Packet):
+        # --- Flow‑control: update sender window with value advertised by peer ---
+        self._snd_wnd = pkt.window or 1  # peer's remaining receive window (0 closes window)
+
+        # ACK handling
+        if pkt.flag_set(FLAG_ACK):
+            if pkt.ack == self._last_ack:
+                self._on_dup_ack()
+            elif _mod32_lt(self._snd_una, pkt.ack):
+                acked = (pkt.ack - self._snd_una) & 0xFFFFFFFF
+                self._snd_una = pkt.ack
+                self._on_new_ack(acked)
+                self._last_ack = pkt.ack
+                if self._snd_una == self._snd_nxt and self._timer:
+                    self._timer.cancel()
+                else:
+                    self._start_timer()
+            # else: old ACK, ignore
+
+        # Data reception
+        if pkt.payload:
+            # --- Flow‑control: shrink our advertised window by newly buffered bytes ---
+            self._rcv_wnd = max(0, MAX_WINDOW - len(self._recv_buf))
+            if pkt.seq == self._rcv_nxt:
+                self._recv_buf.extend(pkt.payload)
+                self._rcv_nxt = (self._rcv_nxt + len(pkt.payload)) & 0xFFFFFFFF
+                with self._recv_cv:
+                    self._recv_cv.notify_all()
+            ack = Packet(self.local_addr[1], self.remote_addr[1], self._snd_nxt, self._rcv_nxt,
+                          FLAG_ACK, self._rcv_wnd)
+            self._send_raw(ack)
+
+        # FIN handling
+        if pkt.flag_set(FLAG_FIN):
+            self._rcv_nxt = (pkt.seq + 1) & 0xFFFFFFFF
+            ack = Packet(self.local_addr[1], self.remote_addr[1], self._snd_nxt, self._rcv_nxt,
+                          FLAG_ACK, self._rcv_wnd)
+            self._send_raw(ack)
+            if not self._closing:
+                self.close()
+            else:
+                self._closed.set()
+
+    def _rx_loop(self):
+        while not self._closed.is_set():
             try:
-                self.socket.settimeout(1.0)
-                data, sender = self.socket.recvfrom(4096)
-                if sender != self.peer:
-                    continue
-                packet = Packet.from_bytes(data)
-                if packet.fin:
-                    self._handle_fin(packet)
-                    break
-            except socket.timeout:
-                print("[CLOSE] Timeout waiting for FIN. Closing anyway.")
-                break
-
-        self.closed = True
-        print("[CLOSE] Connection fully closed.")
-
-    def _handle_fin(self, packet):
-        self.fin_received = True
-
-        ack_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
-                            ack_num=packet.seq_num + 1,
-                            ack=True, window_size=self.sender_window)
-        self.socket.sendto(ack_packet.to_bytes(), self.peer)
-        print(f"[FIN] Received FIN. Sent ACK")
-
-        time.sleep(0.1)
-        fin_packet = Packet(src_port=self.local_port, dest_port=self.remote_port, seq_num=self.next_seq_num,
-                            ack_num=packet.seq_num + 1,
-                            fin=True, window_size=self.sender_window)
-        self.socket.sendto(fin_packet.to_bytes(), self.peer)
-        print(f"[FIN] Sent FIN in response")
-
-        self.closed = True
-
-def accept(self):
-    # Blocks until a connection is available in the accept queue
-    return self.accept_queue.get()
-
-def enqueue_connection(self, connection):
-    # Called when a connection has completed handshake
-    self.accept_queue.put(connection)
+                data, addr = self._sock.recvfrom(65535)
+            except BlockingIOError:
+                time.sleep(0.01)
+                continue
+            if addr != self.remote_addr:
+                continue
+            try:
+                pkt = Packet.from_bytes(data)
+            except ValueError:
+                continue
+            self._handle(pkt)
