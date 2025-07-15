@@ -1,9 +1,3 @@
-"""
-Reliable byte‑stream Connection built on Packet and UDP socket.
-Implements 3‑way handshake, data transfer with ACKs, 4‑way close, **retransmission**,
-**basic TCP‑like congestion control (Tahoe/Reno)**.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -18,7 +12,6 @@ log = logging.getLogger(__name__)
 
 
 class Connection:
-    """Represents one established pseudo‑TCP connection (duplex)."""
 
     # ------------------------------------------------------------------
     # Construction / state

@@ -1,14 +1,11 @@
-"""
-Common protocol definitions and Packet class for pseudo-TCP over UDP.
-"""
-
 import struct
 
 # === Constants ===
-MSS = 536  # bytes
-DEFAULT_RTO = 0.5  # seconds
-MAX_WINDOW = 65535  # uint16
 
+MSS = 536  # bytes
+DEFAULT_RTO = 0.5  # seconds, retransmit
+MAX_WINDOW = 65535  # uint16
+# assigned numbers for OR
 FLAG_SYN = 0x01
 FLAG_ACK = 0x02
 FLAG_FIN = 0x04
@@ -24,7 +21,6 @@ def _mod32_lt(a: int, b: int) -> bool:
 
 
 class Packet:
-    """Lightweight transport segment used by our UDP-based TCP re-implementation."""
 
     __slots__ = (
         "src_port",

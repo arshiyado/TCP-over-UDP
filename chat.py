@@ -1,13 +1,10 @@
 """
-Multi‑client chat over pseudo‑TCP with custom letter‑shift cipher and verbose logging.
+Multi-client chat over pseudo-TCP with custom letter-shift cipher.
 
 Usage:
-  python chat.py server            # listen on port 9000 (multi‑client)
-  python chat.py client <server>   # connect to host:9000
-
-Typing «quit» در هر سمت اتصال را می‌بندد.
-رمزنگاری: برای کاراکترهای الفبایی بر اساس اندیس (mod 5) شیفت سزاری متفاوت اعمال می‌شود:
-  idx%5==0 → +10، 1→+2، 2→+16، 3→+23، 4→+25. کاراکترهای غیرحرفی دست‌نخورده می‌مانند.
+  python chat.py server
+  python chat.py client <server>
+Typing “quit” on either side cleanly closes the connection.
 """
 
 from __future__ import annotations
@@ -20,13 +17,10 @@ from typing import List, Callable
 from tcp_socket import TCPSocket
 from packet import Packet
 
-PORT = 9000  # ثابت پورت سرور
+PORT = 9000  # server port
 
-# ---------------------------------------------------------------------------
-# Caesar‑family custom cipher helpers
-# ---------------------------------------------------------------------------
-
-_SHIFTS = [10, 2, 16, 23, 25]  # per index mod 5
+# ---------------------------------------------------------------------------  cipher helpers
+_SHIFTS = [10, 2, 16, 23, 25]  # per-character shift pattern
 
 
 def _shift_char(ch: str, k: int) -> str:
@@ -36,51 +30,35 @@ def _shift_char(ch: str, k: int) -> str:
     if 'A' <= ch <= 'Z':
         base = ord('A')
         return chr((ord(ch) - base + k) % 26 + base)
-    return ch  # non‑alpha unchanged
+    return ch
 
 
 def encrypt(text: str) -> bytes:
-    out = [
-        _shift_char(ch, _SHIFTS[i % 5]) for i, ch in enumerate(text)
-    ]
-    return ''.join(out).encode()
+    return ''.join(_shift_char(ch, _SHIFTS[i % 5]) for i, ch in enumerate(text)).encode()
 
 
 def decrypt(data: bytes) -> str:
     txt = data.decode(errors='ignore')
-    out = [
-        _shift_char(ch, (26 - _SHIFTS[i % 5]) % 26) for i, ch in enumerate(txt)
-    ]
-    return ''.join(out)
+    return ''.join(_shift_char(ch, (26 - _SHIFTS[i % 5]) % 26) for i, ch in enumerate(txt))
 
-# ---------------------------------------------------------------------------
-# Runtime packet logging (unchanged)
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------  packet logging (optional, unchanged)
 _original_to_bytes = Packet.to_bytes
-
 def _to_bytes_logged(self: Packet):
     blob = _original_to_bytes(self)
     logging.debug("TX %s", self)
     return blob
-
 Packet.to_bytes = _to_bytes_logged  # type: ignore
 
 _original_from_bytes = Packet.from_bytes
-
 def _from_bytes_logged(data: bytes) -> Packet:
     pkt = _original_from_bytes(data)
     logging.debug("RX %s", pkt)
     return pkt
-
 Packet.from_bytes = staticmethod(_from_bytes_logged)  # type: ignore
 
-# ---------------------------------------------------------------------------
-# I/O helpers
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------  I/O helpers
 def _reader(conn, tag: str):
-    """Read bytes until plaintext newline, then decrypt & display."""
+    """Read bytes until newline; decrypt & display."""
     buf = bytearray()
     while True:
         try:
@@ -88,44 +66,56 @@ def _reader(conn, tag: str):
         except Exception as exc:
             logging.error("%s receive error: %s", tag, exc)
             break
+
         if not ch:
             continue
+
         if ch == b"\n":
             if buf:
                 msg = decrypt(bytes(buf))
                 print(f"[peer:{tag}] {msg}")
                 logging.info("[peer:%s] %s", tag, msg)
                 if msg.strip() == "quit":
-                    break
+                    try:
+                        conn.close()        # ✨ NEW — clean shutdown
+                    finally:
+                        break
                 buf.clear()
         else:
             buf.extend(ch)
 
 
 def _writer(get_conns: Callable[[], List]):
-    """Encrypt each line, keep plain newline, broadcast to all connections."""
+    """Encrypt each input line and broadcast to all live connections."""
     for line in sys.stdin:
         line_txt = line.rstrip("\n")
-        cipher = encrypt(line_txt) + b"\n"  # newline delimiter remains plain
+        cipher = encrypt(line_txt) + b"\n"
+
+        # send to every connection
         for c in list(get_conns()):
             try:
                 c.send(cipher)
             except Exception as exc:
                 logging.error("send to %s failed: %s", c.remote_addr, exc)
+
         print(f"[me] {line_txt}")
         logging.info("[me] %s", line_txt)
+
         if line_txt.strip() == "quit":
+            # ✨ NEW — close all connections before exit
+            for c in list(get_conns()):
+                try:
+                    c.close()
+                except Exception:
+                    pass
             break
 
-# ---------------------------------------------------------------------------
-# Server / Client entry points
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------  server / client
 def run_server():
     sock = TCPSocket()
     sock.bind("0.0.0.0", PORT)
     sock.listen()
-    print(f"[server] Listening on port {PORT} …")
+    print(f"[server] Listening on port {PORT}…")
 
     connections: List = []
     conns_lock = threading.Lock()
@@ -140,7 +130,6 @@ def run_server():
             threading.Thread(target=_reader, args=(conn, tag), daemon=True).start()
 
     threading.Thread(target=accept_loop, daemon=True).start()
-
     _writer(lambda: connections)
 
 
@@ -151,10 +140,7 @@ def run_client(host: str):
     threading.Thread(target=_reader, args=(conn, "server"), daemon=True).start()
     _writer(lambda: [conn])
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
+# ---------------------------------------------------------------------------  entry-point
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG,
                         format="%(asctime)s [%(levelname)s] %(message)s",
